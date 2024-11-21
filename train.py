@@ -43,6 +43,7 @@ parser.add_argument("--NN_norm", default='None', choices=['row','sym','None'], t
 parser.add_argument("--FF_norm", default='None', choices=['row','sym','None'], type=str)
 parser.add_argument("--table", default=None, type=str)
 
+parser.add_argument("--inductive", default=False, type=bool)
 parser.add_argument("--use_feature_embeddings", default=0, type=int)
 parser.add_argument("--feature_embeddings", type=str)
 
