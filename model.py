@@ -44,6 +44,7 @@ class Model:
         # features set to None if no features are used in
         # in the first layer
         features = self.args.get("feature_embeddings", None)
+        self.feature_layer_outputs = {}  # Store embeddings for inference
 
         for i, layer in enumerate(self.layers):
             with tf.variable_scope(layer + "_%d" % i):
@@ -66,18 +67,21 @@ class Model:
                 self.layer_outputs.append(features)
                 self.model_weights.append(model.W)
                 self.aux_embeddings.append(model.aux_embeddings)
+                
+                if layer in ["F", "X", "TX"]:  # Modify as per desired layers
+                    self.feature_layer_outputs[layer] = features
                 ####################################################
 
         self.all_predictions = features
         self.predictions = tf.gather(self.all_predictions, self.nodes)
 
+
+
     def _loss(self):
-        """
-        Total loss = Classification Loss + Weight Regularization + Embedding Regularization
-            Classification Loss -> Cross Entropy Loss
-        """
         self.emb_reg = self.args["emb_reg"] * self._emb_reg()
         self.wt_reg = self.args["wt_reg"] * self._wt_reg()
+
+        # Handle unseen feature embeddings if available
         self.pred_error = tf.reduce_mean(
             tf.nn.softmax_cross_entropy_with_logits(
                 logits=self.predictions, labels=self.labels
@@ -87,6 +91,19 @@ class Model:
         self.opt = tf.train.AdamOptimizer(learning_rate=self.learning_rate).minimize(
             self.loss
         )
+        
+    def precompute_embeddings(self, sess, args):
+        """
+        Precompute embeddings for training and validation datasets for inductive inference.
+        """
+        args["dropout"] = 0.0
+        feed_dict = self.construct_feed_dict(args)
+
+        precomputed_embeddings = sess.run(self.feature_layer_outputs, feed_dict=feed_dict)
+        print("Precomputed Embeddings for Inductive Inference")
+        print(precomputed_embeddings)
+        return precomputed_embeddings
+
 
     def _emb_reg(self):
         """
@@ -171,6 +188,27 @@ class Model:
             feed_dict.update({placeholder: args[key]})
         return feed_dict
 
+    def construct_feed_dict(self, args, precomputed_embeddings=None):
+        """
+        Helper function to construct the feed dict.
+        Extends support for precomputed embeddings in inductive mode.
+        """
+        feed_dict = {}
+        for key, placeholder in self.placeholders.items():
+            # Populate placeholders from args
+            if key in args:
+                feed_dict.update({placeholder: args[key]})
+        
+        # Add precomputed embeddings for inductive mode
+        if precomputed_embeddings is not None:
+            for key, value in precomputed_embeddings.items():
+                # Ensure the placeholder exists before updating
+                if key in self.placeholders:
+                    feed_dict.update({self.placeholders[key]: value})
+        
+        return feed_dict
+
+
     def _get_layer_specs(self, layer_ID, features=None):
         """
         Constructs the specification for each layer with the following details.
@@ -189,6 +227,11 @@ class Model:
         """
         The training loop is defined in this function.
         """
+
+        # Precompute embeddings for inductive mode
+        if args.get("inductive", False):
+            precomputed = self.precompute_embeddings(sess, args)
+            args["precomputed_embeddings"] = precomputed
 
         ####################################################
         # Setting up the data and auxiliary variables
@@ -244,11 +287,18 @@ class Model:
                 ]
                 batch_start = batch_start + args["batch_size_train"]
 
-                args["nodes"] = nodes_batch
-                args["labels"] = labels_batch
-                args["learning_rate"] = learning_rate
-
-                feed_dict = self.construct_feed_dict(args)
+                # Inductive mode: Add precomputed embeddings to feed_dict
+                if args.get("inductive", False):
+                    feed_dict = self.construct_feed_dict(
+                        args={"nodes": nodes_batch, "labels": labels_batch},
+                        precomputed_embeddings=args.get("precomputed_embeddings")
+                    )
+                else:
+                    # Transductive mode
+                    args["nodes"] = nodes_batch
+                    args["labels"] = labels_batch
+                    args["learning_rate"] = learning_rate
+                    feed_dict = self.construct_feed_dict(args)
 
                 outs = sess.run(
                     [self.opt, self.loss, self.pred_error, self.emb_reg, self.wt_reg],
@@ -271,7 +321,11 @@ class Model:
             epoch_time = time.time() - start_time
 
             # Get Predictions for all the nodes
-            all_predictions = self.get_predictions(sess, args)
+            if args.get("inductive", False):
+                unseen_features = args.get("precomputed_embeddings", None)
+                all_predictions = self.get_predictions(sess, args, unseen_features=unseen_features)
+            else:
+                all_predictions = self.get_predictions(sess, args)
 
             # Get Predicted Class Labels
             train_preds = all_predictions[train_data[:, 0]].argmax(axis=1)
@@ -302,25 +356,36 @@ class Model:
                 print("Val Acc - %0.03f" % metrics["ValAccuracy"])
                 print("Test Acc - %0.03f" % metrics["TestAccuracy"])
 
-            if metrics["ValAccuracy"] > best_metrics.get("ValAccuracy", 0.0):
-                best_metrics.update(metrics)
-                dump = self.get_model_params(sess, args)
-                patience = 0
-            else:
-                patience = patience + 1
+                if metrics["ValAccuracy"] > best_metrics.get("ValAccuracy", 0.0):
+                    best_metrics.update(metrics)
+                    dump = self.get_model_params(sess, args)
+                    patience = 0
+                else:
+                    patience = patience + 1
 
-            if patience == early_stopping:
-                # Early Stopping
-                break
+                if patience == early_stopping:
+                    # Early Stopping
+                    break
 
         return best_metrics, dump
 
-    def get_predictions(self, sess, args):
+   
+   
+    def get_predictions(self, sess, args, unseen_features=None):
         """
-        Gets predictions for all the nodes.
+        Gets predictions for all nodes. Supports unseen features for inductive inference.
         """
         args["dropout"] = 0.0
         feed_dict = self.construct_feed_dict(args)
+
+        # If unseen features are provided, update the feed_dict
+        # Example of validating unseen_features
+        if unseen_features is not None:
+            if self.placeholders.get("feature_embeddings") is not None:
+                if "feature_embeddings" in unseen_features:
+                    feed_dict[self.placeholders["feature_embeddings"]] = unseen_features["feature_embeddings"]
+
+
         all_predictions = sess.run(self.all_predictions, feed_dict=feed_dict)
         return all_predictions
 
